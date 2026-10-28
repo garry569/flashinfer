@@ -400,6 +400,137 @@ def test_grouped_gemm_nt_masked_output_layout_contract():
         run(torch.zeros(m, n, E, dtype=torch.bfloat16, device=dev), 0x7F)
 
 
+def _swizzle_masked_gemm_sf(sf: torch.Tensor) -> torch.Tensor:
+    """Row-major (l, mn, k_sf) scales -> physical (l, rm, rk, 32, 4, 4) layout."""
+    l, mn, k_sf = sf.shape
+    return (
+        sf.view(torch.uint8)
+        .reshape(l, mn // 128, 4, 32, k_sf // 4, 4)
+        .permute(0, 1, 4, 3, 2, 5)
+        .contiguous()
+        .view(sf.dtype)
+        .permute(3, 4, 1, 5, 2, 0)
+    )
+
+
+def _linear_sfa_inputs(l, m, n, k, dev):
+    torch.manual_seed(7)
+    a = torch.randint(256, (l, m, k // 2), dtype=torch.uint8, device=dev)
+    b = torch.randint(256, (l, n, k // 2), dtype=torch.uint8, device=dev)
+    sfa = (torch.rand(l, m, k // 16, device=dev) * 0.5 + 0.01).to(torch.float8_e4m3fn)
+    sfb = (torch.rand(l, n, k // 16, device=dev) * 0.5 + 0.01).to(torch.float8_e4m3fn)
+    alpha = torch.rand(l, device=dev) + 0.5
+    return a.permute(1, 2, 0), b.permute(1, 2, 0), sfa, sfb, alpha
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.parametrize("k", [256, 7168])
+@pytest.mark.parametrize("sm_count", [None, 1])
+def test_grouped_gemm_nt_masked_linear_sfa(k, sm_count):
+    """linear_sfa must match the swizzled-SFA path bit-for-bit.
+
+    sm_count=1 forces one persistent CTA through every tile, exercising
+    pipeline-stage wraparound. CUDA graph replay covers device-side masked_m.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(dev) not in ((10, 0), (10, 3)):
+        pytest.skip("linear_sfa requires SM100/SM103")
+
+    l, m, n = 3, 256, 512
+    a, b, sfa, sfb, alpha = _linear_sfa_inputs(l, m, n, k, dev)
+    masked_m = torch.tensor([0, 1, 255], dtype=torch.int32, device=dev)
+    ref = torch.empty(l, m, n, dtype=torch.bfloat16, device=dev)
+    out = torch.empty_like(ref)
+    common = dict(
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        alpha=alpha,
+        alpha_dtype="float32",
+        sm_count=sm_count,
+    )
+
+    def run():
+        ref.fill_(float("nan"))
+        out.fill_(float("nan"))
+        grouped_gemm_nt_masked(
+            (a, _swizzle_masked_gemm_sf(sfa)),
+            (b, _swizzle_masked_gemm_sf(sfb)),
+            ref.permute(1, 2, 0),
+            masked_m,
+            **common,
+        )
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, _swizzle_masked_gemm_sf(sfb)),
+            out.permute(1, 2, 0),
+            masked_m,
+            linear_sfa=True,
+            **common,
+        )
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run()
+    for counts in ([0, 1, 255], [256, 128, 0], [129, 256, 2], [0, 0, 0]):
+        masked_m.copy_(torch.tensor(counts, dtype=torch.int32, device=dev))
+        graph.replay()
+        torch.cuda.synchronize()
+        valid = torch.arange(m, device=dev)[None, :] < masked_m[:, None]
+        torch.testing.assert_close(out[valid], ref[valid], atol=0.0, rtol=0.0)
+        assert not torch.isnan(out[valid]).any()
+
+
+@pytest.mark.skipif(
+    not is_cute_dsl_available(), reason="Please `pip install nvidia-cutlass-dsl`"
+)
+@pytest.mark.parametrize(
+    "invalid", ["shape", "stride", "sf_vec_size", "mma_tiler_mn", "swap_ab"]
+)
+def test_grouped_gemm_nt_masked_linear_sfa_rejects_invalid_contract(invalid):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    dev = torch.device("cuda:0")
+    if torch.cuda.get_device_capability(dev) not in ((10, 0), (10, 3)):
+        pytest.skip("linear_sfa requires SM100/SM103")
+
+    l, m, n, k = 2, 128, 128, 256
+    a, b, sfa, sfb, _ = _linear_sfa_inputs(l, m, n, k, dev)
+    kwargs = dict(
+        ab_dtype="float4_e2m1fn",
+        sf_dtype="float8_e4m3fn",
+        c_dtype="bfloat16",
+        sf_vec_size=16,
+        linear_sfa=True,
+    )
+    if invalid == "shape":
+        sfa = sfa.flatten()
+    elif invalid == "stride":
+        sfa = sfa.transpose(0, 1).contiguous().transpose(0, 1)
+    elif invalid == "sf_vec_size":
+        kwargs["sf_vec_size"] = 32
+    elif invalid == "mma_tiler_mn":
+        kwargs["mma_tiler_mn"] = (256, 128)
+    else:
+        kwargs["is_swap_ab"] = True
+    out = torch.empty(l, m, n, dtype=torch.bfloat16, device=dev)
+    out_view = out.permute(2, 1, 0) if invalid == "swap_ab" else out.permute(1, 2, 0)
+    with pytest.raises(ValueError, match="linear_sfa"):
+        grouped_gemm_nt_masked(
+            (a, sfa),
+            (b, _swizzle_masked_gemm_sf(sfb)),
+            out_view,
+            torch.full((l,), m, dtype=torch.int32, device=dev),
+            **kwargs,
+        )
+
+
 if __name__ == "__main__":
     test_blockscaled_gemm_python_interface(
         lm=(1, 1024),

@@ -63,6 +63,7 @@ def grouped_gemm_nt_masked(
     barrier_flag_multicast: Optional[torch.Tensor] = None,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    linear_sfa: bool = False,
     **kwargs,
 ):
     r"""Masked, batched, block-scaled GEMM on Blackwell (SM100/SM103) and Rubin (SM107).
@@ -140,6 +141,14 @@ def grouped_gemm_nt_masked(
     is_swap_ab : bool
         If ``True``, swap the ``lhs``/``rhs`` input tensors.  Defaults to
         ``False``.
+    linear_sfa : bool
+        If ``True``, ``SFA`` is a contiguous row-major E4M3 tensor with
+        physical shape ``(l, m, k / 16)`` instead of the swizzled MMA layout,
+        avoiding a separate scale reordering kernel.  SM100/SM103 only; requires
+        NVFP4 inputs, ``m % 128 == 0``, ``k % 256 == 0``,
+        ``mma_tiler_mn=(128, 128)``, ``cluster_shape_mn=(1, 1)``, and no
+        swap-AB or combine fusion.  ``SFB`` keeps the swizzled layout.
+        Defaults to ``False``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -190,6 +199,8 @@ def grouped_gemm_nt_masked(
         raise ValueError("SM110 is not supported for cute-dsl backend.")
 
     if major == 10 and minor == 7:
+        if linear_sfa:
+            raise ValueError("linear_sfa=True is supported on SM100/SM103 only")
         # ----------------------------------------------------------------
         # SM107 (Rubin)
         # ----------------------------------------------------------------
@@ -282,6 +293,7 @@ def grouped_gemm_nt_masked(
             barrier_flag_multicast=barrier_flag_multicast,
             is_combine_fusion=is_combine_fusion,
             is_swap_ab=is_swap_ab,
+            linear_sfa=linear_sfa,
             **kwargs,
         )
 

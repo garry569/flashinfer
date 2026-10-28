@@ -636,6 +636,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         num_ranks: int = 0,
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
+        linear_sfa: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -670,6 +671,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.num_ranks = num_ranks
         self.is_combine_fusion = is_combine_fusion
         self.is_swap_ab = is_swap_ab
+        self.linear_sfa = linear_sfa
 
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -685,9 +687,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         )
         self.mma_warp_id = 4
         self.tma_warp_id = 5
+        # Linear SFA uses extra warps to copy scales into the MMA SMEM layout.
+        self.sfa_warp_id = 6
+        self.num_sfa_load_warps = 4 if linear_sfa else 0
         self.threads_per_warp = 32
-        self.threads_per_cta = self.threads_per_warp * len(
-            (self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id)
+        self.threads_per_cta = self.threads_per_warp * (
+            len((self.mma_warp_id, self.tma_warp_id, *self.epilog_warp_id))
+            + self.num_sfa_load_warps
         )
         # Set barrier id for cta sync, epilogue sync and tmem ptr sync
         self.cta_sync_bar_id = 0
@@ -916,6 +922,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_layout = blockscaled_utils.tile_atom_to_shape_SF(
             a_tensor.shape, self.sf_vec_size
         )
+        if cutlass.const_expr(self.linear_sfa):
+            # Row-major (m, k / sf_vec_size, l) scales viewed with the MMA atom shape.
+            m, k, l = a_tensor.shape
+            sf_k = k // self.sf_vec_size
+            sfa_layout = cute.make_layout(
+                ((32, 4, m // 128), (self.sf_vec_size, 4, sf_k // 4), l),
+                stride=((sf_k, 32 * sf_k, 128 * sf_k), (0, 1, 4), m * sf_k),
+            )
         sfa_tensor = cute.make_tensor(sfa_tensor.iterator, sfa_layout)
 
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
@@ -980,15 +994,17 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_smem_layout = cute.slice_(
             self.sfa_smem_layout_staged, (None, None, None, 0)
         )
-        tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
-            sfa_op,
-            sfa_tensor,
-            sfa_smem_layout,
-            self.mma_tiler,
-            tiled_mma,
-            self.cluster_layout_vmnk.shape,
-            internal_type=cutlass.Int16,
-        )
+        tma_atom_sfa, tma_tensor_sfa = None, sfa_tensor
+        if cutlass.const_expr(not self.linear_sfa):
+            tma_atom_sfa, tma_tensor_sfa = cute.nvgpu.make_tiled_tma_atom_A(
+                sfa_op,
+                sfa_tensor,
+                sfa_smem_layout,
+                self.mma_tiler,
+                tiled_mma,
+                self.cluster_layout_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
 
         # Setup TMA load for SFB
         sfb_op = sm100_utils.cluster_shape_to_tma_atom_SFB(
@@ -1009,7 +1025,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
 
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         b_copy_size = cute.size_in_bytes(self.b_dtype, b_smem_layout)
-        sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+        sfa_copy_size = (
+            0 if self.linear_sfa else cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
+        )
         sfb_copy_size = cute.size_in_bytes(self.sf_dtype, sfb_smem_layout)
         self.num_tma_load_bytes = (
             a_copy_size + b_copy_size + sfa_copy_size + sfb_copy_size
@@ -1154,7 +1172,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         mA_mkl: cute.Tensor,
         tma_atom_b: cute.CopyAtom,
         mB_nkl: cute.Tensor,
-        tma_atom_sfa: cute.CopyAtom,
+        tma_atom_sfa: Optional[cute.CopyAtom],
         mSFA_mkl: cute.Tensor,
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
@@ -1189,7 +1207,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if warp_idx == self.tma_warp_id:
             cpasync.prefetch_descriptor(tma_atom_a)
             cpasync.prefetch_descriptor(tma_atom_b)
-            cpasync.prefetch_descriptor(tma_atom_sfa)
+            if cutlass.const_expr(not self.linear_sfa):
+                cpasync.prefetch_descriptor(tma_atom_sfa)
             cpasync.prefetch_descriptor(tma_atom_sfb)
             if cutlass.const_expr(tma_atom_c is not None):
                 cpasync.prefetch_descriptor(tma_atom_c)
@@ -1221,11 +1240,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         smem = utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
+        ab_empty_mbar_ptr = storage.ab_empty_mbar_ptr.data_ptr()
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.ptr
         tmem_holding_buf = storage.tmem_holding_buf.ptr
 
         # Initialize mainloop ab_pipeline (barrier) and states
-        ab_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        # The full barrier also waits for one cp.async arrival per SFA loader thread.
+        ab_pipeline_producer_group = pipeline.CooperativeGroup(
+            pipeline.Agent.Thread,
+            1 + self.threads_per_warp * self.num_sfa_load_warps,
+        )
         num_tma_producer = self.num_mcast_ctas_a + self.num_mcast_ctas_b - 1
         ab_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, num_tma_producer
@@ -1394,15 +1418,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_cta_layout = a_cta_layout
         # ((atom_v, rest_v), STAGE)
         # ((atom_v, rest_v), RestM, RestK, RestL)
-        tAsSFA, tAgSFA = cute.nvgpu.cpasync.tma_partition(
-            tma_atom_sfa,
-            block_in_cluster_coord_vmnk[2],
-            sfa_cta_layout,
-            cute.group_modes(sSFA, 0, 3),
-            cute.group_modes(tCgSFA, 0, 3),
-        )
-        tAsSFA = cute.filter_zeros(tAsSFA)
-        tAgSFA = cute.filter_zeros(tAgSFA)
+        if cutlass.const_expr(not self.linear_sfa):
+            tAsSFA, tAgSFA = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_sfa,
+                block_in_cluster_coord_vmnk[2],
+                sfa_cta_layout,
+                cute.group_modes(sSFA, 0, 3),
+                cute.group_modes(tCgSFA, 0, 3),
+            )
+            tAsSFA = cute.filter_zeros(tAsSFA)
+            tAgSFA = cute.filter_zeros(tAgSFA)
 
         # TMA load SFB partition_S/D
         sfb_cta_layout = cute.make_layout(
@@ -1445,9 +1470,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
 
         #
-        # Specialized TMA load warp
+        # Specialized TMA load warp and optional linear SFA loader warps
         #
-        if warp_idx == self.tma_warp_id:
+        if warp_idx == self.tma_warp_id or warp_idx >= self.sfa_warp_id:
             #
             # Persistent tile scheduling loop
             #
@@ -1482,9 +1507,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 ]
 
                 # ((atom_v, rest_v), RestK)
-                tAgSFA_slice = tAgSFA[
-                    (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
-                ]
+                if cutlass.const_expr(not self.linear_sfa):
+                    tAgSFA_slice = tAgSFA[
+                        (None, mma_tile_coord_mnl[0], None, mma_tile_coord_mnl[2])
+                    ]
+                else:
+                    sfa_valid_rows = (
+                        tile_sched_params.masked_m[mma_tile_coord_mnl[2]]
+                        - mma_tile_coord_mnl[0] * 128
+                    )
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[
                     (None, mma_tile_coord_mnl[1], None, mma_tile_coord_mnl[2])
@@ -1501,40 +1532,70 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # Tma load loop
                 #
                 for k_block in cutlass.range(0, k_block_cnt, 1, unroll=1):  # noqa: B007
-                    # Conditionally wait for AB buffer empty
-                    ab_pipeline.producer_acquire(
-                        ab_producer_state, peek_ab_empty_status
-                    )
+                    if warp_idx == self.tma_warp_id:
+                        # Conditionally wait for AB buffer empty
+                        ab_pipeline.producer_acquire(
+                            ab_producer_state, peek_ab_empty_status
+                        )
+                    else:
+                        # Only the TMA warp registers the expected transaction bytes.
+                        cute.arch.mbarrier_wait(
+                            ab_empty_mbar_ptr + ab_producer_state.index,
+                            ab_producer_state.phase,
+                        )
 
-                    # TMA load A/B/SFA/SFB
-                    cute.copy(
-                        tma_atom_a,
-                        tAgA_slice[(None, ab_producer_state.count)],
-                        tAsA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=a_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_b,
-                        tBgB_slice[(None, ab_producer_state.count)],
-                        tBsB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=b_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_sfa,
-                        tAgSFA_slice[(None, ab_producer_state.count)],
-                        tAsSFA[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=sfa_full_mcast_mask,
-                    )
-                    cute.copy(
-                        tma_atom_sfb,
-                        tBgSFB_slice[(None, ab_producer_state.count)],
-                        tBsSFB[(None, ab_producer_state.index)],
-                        tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
-                        mcast_mask=sfb_full_mcast_mask,
-                    )
+                    if cutlass.const_expr(self.linear_sfa):
+                        if warp_idx >= self.sfa_warp_id:
+                            self.load_linear_sfa(
+                                mSFA_mkl,
+                                sSFA,
+                                sfa_smem_layout_staged,
+                                tidx,
+                                mma_tile_coord_mnl,
+                                ab_producer_state,
+                                sfa_valid_rows,
+                                ab_pipeline.producer_get_barrier(ab_producer_state),
+                            )
+
+                    if warp_idx == self.tma_warp_id:
+                        # TMA load A/B/SFA/SFB
+                        cute.copy(
+                            tma_atom_a,
+                            tAgA_slice[(None, ab_producer_state.count)],
+                            tAsA[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                ab_producer_state
+                            ),
+                            mcast_mask=a_full_mcast_mask,
+                        )
+                        cute.copy(
+                            tma_atom_b,
+                            tBgB_slice[(None, ab_producer_state.count)],
+                            tBsB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                ab_producer_state
+                            ),
+                            mcast_mask=b_full_mcast_mask,
+                        )
+                        if cutlass.const_expr(not self.linear_sfa):
+                            cute.copy(
+                                tma_atom_sfa,
+                                tAgSFA_slice[(None, ab_producer_state.count)],
+                                tAsSFA[(None, ab_producer_state.index)],
+                                tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                    ab_producer_state
+                                ),
+                                mcast_mask=sfa_full_mcast_mask,
+                            )
+                        cute.copy(
+                            tma_atom_sfb,
+                            tBgSFB_slice[(None, ab_producer_state.count)],
+                            tBsSFB[(None, ab_producer_state.index)],
+                            tma_bar_ptr=ab_pipeline.producer_get_barrier(
+                                ab_producer_state
+                            ),
+                            mcast_mask=sfb_full_mcast_mask,
+                        )
 
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
                     ab_producer_state.advance()
@@ -1553,7 +1614,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             #
             # Wait A/B buffer empty
             #
-            ab_pipeline.producer_tail(ab_producer_state)
+            if warp_idx == self.tma_warp_id:
+                ab_pipeline.producer_tail(ab_producer_state)
 
         #
         # Specialized MMA warp
@@ -2185,6 +2247,59 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             reset_val=0,
                             scope="sys",
                         )
+
+    @cute.jit
+    def load_linear_sfa(
+        self,
+        mSFA_mkl: cute.Tensor,
+        sSFA: cute.Tensor,
+        sfa_smem_layout_staged: cute.Layout,
+        tidx: Int32,
+        mma_tile_coord_mnl: Tuple[Int32, Int32, Int32],
+        ab_producer_state: pipeline.PipelineState,
+        valid_rows: Int32,
+        full_barrier: cute.Pointer,
+    ):
+        """Copy one row-major SFA K block into the MMA scale-factor SMEM layout.
+
+        A 128x256 NVFP4 tile has 128 rows x 16 E4M3 scales, i.e. four 32-bit
+        words per row. In SMEM, word ``w`` of row ``r`` lives at
+        ``w * 128 + (r % 32) * 4 + r // 32``. Four adjacent lanes read the 16
+        contiguous bytes of one row.
+        """
+        m = mSFA_mkl.shape[0][2] * 128
+        sf_k_words = mSFA_mkl.shape[1][2]
+        src = cute.recast_ptr(mSFA_mkl.iterator, dtype=cutlass.Uint32)
+        dst = cute.recast_ptr(sSFA.iterator, dtype=cutlass.Uint32)
+        stage_words = cute.cosize(sfa_smem_layout_staged) // self.num_ab_stage // 4
+        loader_tidx = tidx - self.sfa_warp_id * self.threads_per_warp
+        word = loader_tidx % 4
+        copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(), cutlass.Uint32, num_bits_per_copy=32
+        )
+        pred = cute.make_rmem_tensor((1,), cutlass.Boolean)
+        for i in cutlass.range_constexpr(4):
+            row = loader_tidx // 4 + 32 * i
+            src_idx = (
+                (mma_tile_coord_mnl[2] * m + mma_tile_coord_mnl[0] * 128 + row)
+                * sf_k_words
+                + ab_producer_state.count * 4
+                + word
+            )
+            dst_idx = (
+                ab_producer_state.index * stage_words
+                + word * 128
+                + (row % 32) * 4
+                + row // 32
+            )
+            pred[0] = row < valid_rows
+            cute.copy(
+                copy_atom,
+                cute.make_tensor(src + src_idx, cute.make_layout((1,))),
+                cute.make_tensor(dst + dst_idx, cute.make_layout((1,))),
+                pred=pred,
+            )
+        cute.arch.cp_async_mbarrier_arrive_noinc(full_barrier)
 
     def mainloop_s2t_copy_and_partition(
         self,
@@ -2935,6 +3050,7 @@ class MaskedBatchedMatmulCuteDSL:
         num_ranks: int = 0,
         is_combine_fusion: bool = False,
         is_swap_ab: bool = False,
+        linear_sfa: bool = False,
     ):
         self._m = m
         self._n = n
@@ -2954,6 +3070,7 @@ class MaskedBatchedMatmulCuteDSL:
         self._num_sms = sm_count
         self._is_combine_fusion = is_combine_fusion
         self._is_swap_ab = is_swap_ab
+        self._linear_sfa = linear_sfa
         if not Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
             ab_dtype,
             sf_dtype,
@@ -3136,6 +3253,7 @@ class MaskedBatchedMatmulCuteDSL:
             num_ranks=self._num_ranks,
             is_combine_fusion=self._is_combine_fusion,
             is_swap_ab=self._is_swap_ab,
+            linear_sfa=self._linear_sfa,
         )(
             a_tensor,
             b_tensor,
@@ -3179,6 +3297,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     enable_barrier_flag: bool = False,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    linear_sfa: bool = False,
 ) -> Callable:
     def get_cute_pointers(
         input_tensors: Optional[List[torch.tensor]],
@@ -3443,6 +3562,7 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
             num_ranks=num_ranks,
             is_combine_fusion=is_combine_fusion,
             is_swap_ab=is_swap_ab,
+            linear_sfa=linear_sfa,
         ),
         *get_cute_pointers(None),
         cutlass_torch.current_stream(),
@@ -3503,6 +3623,48 @@ def get_cute_dsl_compiled_masked_gemm_kernel(
     return tensor_api
 
 
+def _check_linear_sfa(
+    sfa: torch.Tensor,
+    *,
+    m: int,
+    k: int,
+    l: int,
+    ab_dtype: str,
+    sf_dtype: str,
+    sf_vec_size: int,
+    mma_tiler_mn: Tuple[int, int],
+    cluster_shape_mn: Tuple[int, int],
+    is_swap_ab: bool,
+    is_combine_fusion: bool,
+) -> None:
+    if ab_dtype != "float4_e2m1fn" or sf_vec_size != 16:
+        raise ValueError("linear_sfa=True requires NVFP4 inputs with sf_vec_size=16")
+    if sf_dtype != "float8_e4m3fn":
+        raise ValueError("linear_sfa=True requires float8_e4m3fn scale factors")
+    if is_swap_ab or is_combine_fusion:
+        raise ValueError("linear_sfa=True does not support swap-AB or combine fusion")
+    if tuple(mma_tiler_mn) != (128, 128) or tuple(cluster_shape_mn) != (1, 1):
+        raise ValueError(
+            "linear_sfa=True requires mma_tiler_mn=(128, 128) and cluster_shape_mn=(1, 1)"
+        )
+    if m % 128 or k % 256:
+        raise ValueError(
+            f"linear_sfa=True requires m % 128 == 0 and k % 256 == 0, got m={m}, k={k}"
+        )
+    expected_shape = (l, m, k // sf_vec_size)
+    if (
+        tuple(sfa.shape) != expected_shape
+        or not sfa.is_contiguous()
+        or sfa.element_size() != 1
+        or sfa.data_ptr() % 16
+    ):
+        raise ValueError(
+            "linear_sfa=True requires a contiguous, 16-byte aligned 1-byte SFA tensor "
+            f"with shape {expected_shape}; got shape={tuple(sfa.shape)}, "
+            f"stride={tuple(sfa.stride())}, dtype={sfa.dtype}"
+        )
+
+
 def _grouped_gemm_nt_masked_sm100(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
@@ -3524,6 +3686,7 @@ def _grouped_gemm_nt_masked_sm100(
     barrier_flag_multicast: Optional[torch.Tensor] = None,
     is_combine_fusion: bool = False,
     is_swap_ab: bool = False,
+    linear_sfa: bool = False,
     **kwargs,
 ):
     """
@@ -3602,6 +3765,15 @@ def _grouped_gemm_nt_masked_sm100(
     is_swap_ab : bool
         If ``True``, swap the ``lhs``/``rhs`` input tensors.  Defaults to
         ``False``.
+    linear_sfa : bool
+        If ``True``, ``SFA`` is a contiguous row-major E4M3 tensor with
+        physical shape ``(l, m, k / 16)`` instead of the swizzled MMA layout.
+        This is the layout produced by row-wise NVFP4 quantization or received
+        from expert-parallel dispatch, so no separate scale reordering kernel
+        is needed.  Requires NVFP4 inputs (``sf_vec_size=16``), ``m`` a
+        multiple of 128, ``k`` a multiple of 256, ``mma_tiler_mn=(128, 128)``,
+        ``cluster_shape_mn=(1, 1)``, and no swap-AB or combine fusion.
+        ``SFB`` keeps the swizzled layout.  Defaults to ``False``.
     **kwargs
         Additional keyword arguments.  Currently recognized:
 
@@ -3715,6 +3887,21 @@ def _grouped_gemm_nt_masked_sm100(
         if mma_tiler_mn != (128, 128):
             raise ValueError("is_combine_fusion=True requires mma_tiler_mn=(128, 128)")
 
+    if linear_sfa:
+        _check_linear_sfa(
+            sfa_torch,
+            m=m,
+            k=k,
+            l=l,
+            ab_dtype=ab_dtype,
+            sf_dtype=sf_dtype,
+            sf_vec_size=sf_vec_size,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            is_swap_ab=is_swap_ab,
+            is_combine_fusion=is_combine_fusion,
+        )
+
     return get_cute_dsl_compiled_masked_gemm_kernel(
         m=m,
         n=n,
@@ -3737,6 +3924,7 @@ def _grouped_gemm_nt_masked_sm100(
         enable_barrier_flag=barrier_flag_local is not None,
         is_combine_fusion=is_combine_fusion,
         is_swap_ab=is_swap_ab,
+        linear_sfa=linear_sfa,
     )(
         a_tensor_gpu=a_torch,
         b_tensor_gpu=b_torch,
